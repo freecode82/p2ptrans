@@ -1,0 +1,116 @@
+#!/usr/bin/env node
+
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+
+// -------------------------
+// 옵션 파싱
+// -------------------------
+const args = process.argv.slice(2);
+const pIndex = args.indexOf('-p');
+const hIndex = args.indexOf('-h');
+const fIndex = args.indexOf('-f');
+
+const port = pIndex !== -1 ? parseInt(args[pIndex + 1]) : 80;
+const host = hIndex !== -1 ? args[hIndex + 1] : 'localhost';
+const defaultDir = fIndex !== -1 ? args[fIndex + 1] : null;
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// chunk 저장 위치
+const CHUNK_TEMP_DIR = "chunk_temp";
+if (!fs.existsSync(CHUNK_TEMP_DIR)) fs.mkdirSync(CHUNK_TEMP_DIR);
+
+// multer
+const upload = multer({ dest: CHUNK_TEMP_DIR });
+
+// 폴더 생성
+function ensureDir(dirPath) {
+    if (!fs.existsSync(dirPath)) {
+        fs.mkdirSync(dirPath, { recursive: true });
+    }
+}
+
+// -------------------------
+// 1) CHUNK 업로드
+// -------------------------
+app.post('/upload-chunk', upload.single('chunk'), (req, res) => {
+    const { uploadId, index } = req.body;
+
+    if (!uploadId || index === undefined) {
+        return res.status(400).send("Missing uploadId or index");
+    }
+
+    const chunkDir = path.join(CHUNK_TEMP_DIR, uploadId);
+    ensureDir(chunkDir);
+
+    const destPath = path.join(chunkDir, `${index}.chunk`);
+
+    fs.renameSync(req.file.path, destPath);
+
+    res.status(200).send("CHUNK_OK");
+});
+
+// -------------------------
+// 2) CHUNK 완료 알림 → 서버에서 파일 조립
+// -------------------------
+app.post('/upload-complete', (req, res) => {
+    const { paths, uploadId, totalChunks, location } = req.body;
+
+    const relativePaths = JSON.parse(paths);
+    const chunkDir = path.join(CHUNK_TEMP_DIR, uploadId);
+
+    if (!fs.existsSync(chunkDir)) {
+        return res.status(400).send("Upload session not found");
+    }
+
+    // 저장 될 폴더 결정
+    let baseDir;
+    if (location && location.trim() !== "") {
+        baseDir = path.resolve(location);
+    } else if (defaultDir) {
+        baseDir = path.resolve(defaultDir);
+    } else {
+        baseDir = path.resolve("downloads");
+    }
+    ensureDir(baseDir);
+
+    // 각 파일 조립
+    for (let relative of relativePaths) {
+        const fileChunkDir = path.join(chunkDir, relative);
+        const destPath = path.join(baseDir, relative);
+
+        // 폴더 생성
+        ensureDir(path.dirname(destPath));
+
+        // 파일 생성
+        const writeStream = fs.createWriteStream(destPath);
+
+        // chunk 조립
+        const chunkCount = parseInt(totalChunks);
+        for (let i = 0; i < chunkCount; i++) {
+            const chunkPath = path.join(fileChunkDir, `${i}.chunk`);
+            const data = fs.readFileSync(chunkPath);
+            writeStream.write(data);
+        }
+
+        writeStream.end();
+    }
+
+    // cleanup
+    fs.rmSync(chunkDir, { recursive: true, force: true });
+
+    res.status(200).send("UPLOAD_COMPLETE");
+});
+
+// -------------------------
+// 서버 실행
+// -------------------------
+app.listen(port, host, () => {
+    console.log(`������ Chunk File Server running at http://${host}:${port}`);
+});
+

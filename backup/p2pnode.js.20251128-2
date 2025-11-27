@@ -1,0 +1,329 @@
+#!/usr/bin/env node
+
+/**
+ * P2P 2.0 파일 전송 시스템
+ * - 양쪽 노드에서 컨트롤 서버는 항상 실행
+ * - 어느 노드에서 명령을 내려도 A→B / B→A 자유 전송
+ * - 업로드(body-limit 문제) 없음. 항상 "다운로드 방향" 전송.
+ *
+ * 역할 요약:
+ *  1) Control Server  (항상 켜짐)  → /api/download-file
+ *  2) Send Orchestrator (--send) → source / target 지정
+ *  3) Source Host  (파일 가진 쪽) → 임시 전송 서버 /download 제공
+ *  4) Target Host (파일 받을 쪽) → Control API로 다운로드 실행
+ */
+
+const express = require("express");
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// -------------------- 공용 유틸 --------------------
+function fileExists(p) {
+    try { fs.accessSync(p); return true; }
+    catch { return false; }
+}
+
+function ensureDir(dir) {
+    if (!fileExists(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+}
+
+// progress bar (선택)
+function drawProgress(downloaded, total) {
+    if (!total) return;
+    const w = 40;
+    const ratio = downloaded / total;
+    const bar = Math.floor(ratio * w);
+    process.stdout.write(
+        `\r[${"█".repeat(bar)}${"-".repeat(w - bar)}] ${Math.floor(ratio * 100)}%`
+    );
+    if (downloaded === total) process.stdout.write("\n");
+}
+
+// -------------------- CONTROL 서버 --------------------
+async function startControlServer(port, host) {
+    const app = express();
+    app.use(express.json());
+
+    console.log(`\n������ CONTROL SERVER RUNNING`);
+    console.log(`  Host: ${host}`);
+    console.log(`  Port: ${port}`);
+    console.log(`  Endpoint: http://${host}:${port}/api/download-file\n`);
+
+    // health check
+    app.get("/api/health", (req, res) => {
+        res.json({ status: "ok" });
+    });
+
+    /**
+     * POST /api/download-file
+     * {
+     *   url: "http://A:9000/download",
+     *   fileName: "a.bin",
+     *   saveDir: "/root/recv",
+     *   progress: true
+     * }
+     */
+    app.post("/api/download-file", async (req, res) => {
+        const { url, fileName, saveDir, progress } = req.body;
+
+        if (!url || !fileName) {
+            return res.status(400).json({ error: "url, fileName 은 필수입니다." });
+        }
+
+        const destDir = saveDir ? path.resolve(saveDir) : process.cwd();
+        ensureDir(destDir);
+
+        const destPath = path.join(destDir, fileName);
+
+        console.log(`\n[CONTROL] 다운로드 요청 접수`);
+        console.log(`  URL  : ${url}`);
+        console.log(`  Dest : ${destPath}`);
+
+        try {
+            const resp = await axios.get(url, { responseType: "stream" });
+
+            const total = parseInt(resp.headers["content-length"] || "0");
+            const ws = fs.createWriteStream(destPath);
+
+            let downloaded = 0;
+
+            await new Promise((resolve, reject) => {
+                resp.data.on("data", chunk => {
+                    downloaded += chunk.length;
+                    if (progress && total) drawProgress(downloaded, total);
+                });
+                resp.data.on("error", reject);
+                ws.on("error", reject);
+                ws.on("finish", resolve);
+
+                resp.data.pipe(ws);
+            });
+
+            console.log(`\n[CONTROL] 다운로드 완료: ${destPath}`);
+            return res.status(200).json({ status: "ok", saved: destPath });
+
+        } catch (err) {
+            console.error(`[CONTROL] 다운로드 실패: ${err.message}`);
+            return res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.listen(port, host);
+}
+
+// -------------------- SEND 모드 (명령자) --------------------
+async function startSendMode(opt) {
+    const {
+        sourceHost,
+        sourceFile,
+        sendPort,
+        targetHost,
+        targetPort,
+        targetSave,
+        progress
+    } = opt;
+
+    const filePath = path.resolve(sourceFile);
+    if (!fileExists(filePath)) {
+        console.error("Error: source-file 경로가 존재하지 않음 → " + filePath);
+        process.exit(1);
+    }
+
+    const fileName = path.basename(filePath);
+    const fileSize = fs.statSync(filePath).size;
+
+    console.log(`\n[SEND] 파일 전송 준비`);
+    console.log(`  source-host : ${sourceHost}`);
+    console.log(`  target-host : ${targetHost}`);
+    console.log(`  file        : ${filePath} (${fileSize} bytes)`);
+    console.log(`  save        : ${targetSave || "(target current dir)"}`);
+    console.log("");
+
+    // STEP 1 — sourceHost에 "전송 서버 시작" RPC 요청
+    const startUrl = `http://${sourceHost}:${targetPort}/api/start-data-server`;
+    // BUT 아직 이런 API 없음 → 실제로는 sourceHost가 SEND 명령자임.
+
+    // 여기에서는 sendHost가 “명령자”와 동일 노드라고 가정했으므로
+    // SEND 명령자는 직접 임시 전송 서버를 띄운다.
+
+    await createTempSendServer({
+        filePath,
+        fileName,
+        sendHost: sourceHost,
+        sendPort,
+        targetHost,
+        targetPort,
+        targetSave,
+        progress
+    });
+}
+
+// -------------------- TEMP DATA SERVER (송신자) --------------------
+async function createTempSendServer(cfg) {
+    const {
+        filePath,
+        fileName,
+        sendHost,
+        sendPort,
+        targetHost,
+        targetPort,
+        targetSave,
+        progress
+    } = cfg;
+
+    const app = express();
+
+    // /download 제공
+    app.get("/download", (req, res) => {
+        console.log(`[DATA] /download 요청 → 파일 전송 시작`);
+        const size = fs.statSync(filePath).size;
+
+        res.setHeader("Content-Type", "application/octet-stream");
+        res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+        res.setHeader("Content-Length", size);
+
+        const rs = fs.createReadStream(filePath);
+        rs.on("error", err => {
+            console.error("[DATA] ReadStream error:", err);
+            res.destroy(err);
+        });
+        rs.pipe(res);
+    });
+
+    // 서버 시작
+    const server = app.listen(sendPort, sendHost, async () => {
+        console.log(`[DATA] 임시 데이터 서버 ON → http://${sendHost}:${sendPort}/download`);
+
+        // STEP 2 — target-host 컨트롤 서버에 “다운로드 시작” 요청
+        const controlUrl = `http://${targetHost}:${targetPort}/api/download-file`;
+
+        try {
+            const resp = await axios.post(controlUrl, {
+                url: `http://${sendHost}:${sendPort}/download`,
+                fileName,
+                saveDir: targetSave,
+                progress: !!progress
+            }, { timeout: 0 });
+
+            console.log(`[SEND] 상대 응답:`, resp.data);
+
+        } catch (err) {
+            console.error(`[SEND] 상대 다운로드 요청 실패: ${err.message}`);
+        }
+
+        console.log(`[DATA] 임시 데이터 서버 종료`);
+        server.close();
+    });
+}
+
+// -------------------- CLI 파서 --------------------
+function parseArgs(argv) {
+    const out = {};
+    for (let i = 0; i < argv.length; i++) {
+        const a = argv[i];
+        if (a.startsWith("--")) {
+            const key = a.slice(2);
+            const next = argv[i + 1];
+            if (!next || next.startsWith("-")) {
+                out[key] = true;
+            } else {
+                out[key] = next;
+                i++;
+            }
+        } else if (a.startsWith("-")) {
+            const key = a.slice(1);
+            const next = argv[i + 1];
+            if (!next || next.startsWith("-")) {
+                out[key] = true;
+            } else {
+                out[key] = next;
+                i++;
+            }
+        }
+    }
+    return out;
+}
+
+// -------------------- MAIN --------------------
+(async () => {
+    const args = parseArgs(process.argv.slice(2));
+
+    // CONTROL 모드
+    if (args.control) {
+        const host = args.h || args.host || "0.0.0.0";
+        const port = args.p || args.port || 7000;
+        await startControlServer(parseInt(port), host);
+        return;
+    }
+
+    // SEND 모드
+    if (args.send) {
+        const sourceHost  = args["source-host"] || args["send-host"] || "127.0.0.1";
+        const sendPort    = parseInt(args["send-port"] || 9000);
+        const sourceFile  = args["source-file"] || args.f;
+
+        const targetHost  = args["target-host"] || args["client-host"] || null;
+        const targetPort  = parseInt(args["target-port"] || args["client-port"] || 7000);
+        const targetSave  = args["target-save"] || args["client-save"] || null;
+
+        const progress    = args.b || args.progress || false;
+
+        if (!sourceFile) {
+            console.error("Error: --source-file <파일> 은 필수입니다.");
+            process.exit(1);
+        }
+        if (!targetHost) {
+            console.error("Error: --target-host <IP> 은 필수입니다.");
+            process.exit(1);
+        }
+
+        await startSendMode({
+            sourceHost,
+            sourceFile,
+            sendPort,
+            targetHost,
+            targetPort,
+            targetSave,
+            progress
+        });
+        return;
+    }
+
+    console.log(`
+사용법:
+
+1) 컨트롤 서버 실행 (양 노드 모두에서):
+   node p2pnode.js --control -p 7000 -h 0.0.0.0
+
+2) 아무쪽에서나 전송 명령:
+   node p2pnode.js --send \\
+       --source-host 10.0.0.10 \\
+       --source-file /root/a.bin \\
+       --send-port 9000 \\
+       --target-host 10.0.0.20 \\
+       --target-port 7000 \\
+       --target-save /root/downloads \\
+       -b
+
+옵션 요약:
+
+--control         컨트롤 서버
+  -p              포트 (기본 7000)
+  -h              호스트(default 0.0.0.0)
+
+--send            파일 전송 명령자
+  --source-host   파일을 가진 노드 IP
+  --source-file   보낼 파일
+  --send-port     임시 데이터 서버 포트 (기본 9000)
+
+  --target-host   파일 받을 노드 IP
+  --target-port   그 노드의 컨트롤 서버 포트(기본 7000)
+  --target-save   저장 경로
+
+  -b, --progress  진행률 표시
+`);
+})();
+

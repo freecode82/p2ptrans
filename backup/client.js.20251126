@@ -1,0 +1,102 @@
+#!/usr/bin/env node
+
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const FormData = require('form-data');
+
+// -------------------------
+// 옵션 파싱
+// -------------------------
+const args = process.argv.slice(2);
+const fIndex = args.indexOf('-f');
+const lIndex = args.indexOf('-l');
+const hIndex = args.indexOf('-h');
+const pIndex = args.indexOf('-p');
+
+if (fIndex === -1) {
+    console.error("Error: -f <file_or_directory> is required");
+    process.exit(1);
+}
+
+const target = args[fIndex + 1];          
+const location = lIndex !== -1 ? args[lIndex + 1] : null;
+const host = hIndex !== -1 ? args[hIndex + 1] : "localhost";
+const port = pIndex !== -1 ? parseInt(args[pIndex + 1]) : 80;
+
+// -------------------------
+// 파일/폴더를 순회하며 상대경로 + 파일 스트림 수집
+// -------------------------
+
+// 상대경로 저장용 배열
+let relativePaths = [];
+// 파일 스트림 저장용 배열
+let fileStreams = [];
+
+/**
+ * filePath: 현재 처리 중인 파일 or 폴더 경로
+ * baseDir: 폴더 자체를 포함시키기 위해 기준이 되는 상위 디렉토리
+ */
+function collectFiles(filePath, baseDir) {
+    const stat = fs.statSync(filePath);
+
+    if (stat.isFile()) {
+        // 폴더/파일 전체 경로를 상대경로로 계산
+        const relative = path.relative(baseDir, filePath);
+
+        relativePaths.push(relative);
+        fileStreams.push({
+            relative,
+            stream: fs.createReadStream(filePath)
+        });
+
+    } else if (stat.isDirectory()) {
+        const items = fs.readdirSync(filePath);
+        items.forEach(item => {
+            collectFiles(path.join(filePath, item), baseDir);
+        });
+    }
+}
+
+// -------------------------
+// 실행부
+// -------------------------
+(async () => {
+    try {
+        const form = new FormData();
+
+        if (location) {
+            form.append("location", location);
+        }
+
+        const targetPath = path.resolve(target);
+
+        // 폴더 전체를 포함시키기 위해 baseDir은 target 폴더의 상위 디렉토리
+        const baseDir = fs.statSync(targetPath).isDirectory()
+            ? path.dirname(targetPath)
+            : path.dirname(targetPath);
+
+        // 파일 및 상대경로 수집
+        collectFiles(targetPath, baseDir);
+
+        // paths 배열을 JSON으로 서버에 전송
+        form.append("paths", JSON.stringify(relativePaths));
+
+        // 파일 스트림 전송
+        fileStreams.forEach(f => {
+            form.append("files", f.stream, f.relative);
+        });
+
+        const url = `http://${host}:${port}/upload`;
+
+        const res = await axios.post(url, form, {
+            headers: form.getHeaders()
+        });
+
+        console.log("Server Response:", res.status);
+
+    } catch (err) {
+        console.error("Upload Error:", err.message);
+    }
+})();
+

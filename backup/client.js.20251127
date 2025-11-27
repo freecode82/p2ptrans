@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+// 옵션 파싱
+const args = process.argv.slice(2);
+const fIndex = args.indexOf('-f');
+const lIndex = args.indexOf('-l');
+const hIndex = args.indexOf('-h');
+const pIndex = args.indexOf('-p');
+
+if (fIndex === -1) {
+    console.error("Error: -f <file_or_directory> is required");
+    process.exit(1);
+}
+
+const target = args[fIndex + 1];
+const location = lIndex !== -1 ? args[lIndex + 1] : null;
+const host = hIndex !== -1 ? args[hIndex + 1] : "localhost";
+const port = pIndex !== -1 ? parseInt(args[pIndex + 1]) : 80;
+
+const SERVER_URL = `http://${host}:${port}`;
+
+// -------------------------
+// 설정
+// -------------------------
+const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
+
+// -------------------------
+// 폴더 전체 순회하면서 파일 목록과 상대경로 수집
+// -------------------------
+let fileList = [];
+
+function collectFiles(filePath, baseDir) {
+    const stat = fs.statSync(filePath);
+
+    if (stat.isFile()) {
+        const relative = path.relative(baseDir, filePath);
+        fileList.push({ filePath, relative });
+    } else if (stat.isDirectory()) {
+        const items = fs.readdirSync(filePath);
+        items.forEach(item => {
+            collectFiles(path.join(filePath, item), baseDir);
+        });
+    }
+}
+
+// -------------------------
+// 실행부
+// -------------------------
+(async () => {
+    const targetPath = path.resolve(target);
+    const baseDir = path.dirname(targetPath);
+
+    collectFiles(targetPath, baseDir);
+
+    for (let file of fileList) {
+        console.log(`������ Sending ${file.relative}`);
+        await uploadFileChunks(file.filePath, file.relative);
+    }
+
+    // 모든 파일 정보 전송
+    await axios.post(`${SERVER_URL}/upload-complete`, {
+        paths: JSON.stringify(fileList.map(f => f.relative)),
+        uploadId: UPLOAD_ID,
+        totalChunks: LAST_CHUNK_COUNT,
+        location
+    });
+
+    console.log("������ Upload Completed");
+})();
+
+// -------------------------
+// 파일 청크 업로드 함수
+// -------------------------
+const UPLOAD_ID = crypto.randomBytes(16).toString("hex");
+let LAST_CHUNK_COUNT = 0;
+
+async function uploadFileChunks(filePath, relativePath) {
+    const stat = fs.statSync(filePath);
+    const totalChunks = Math.ceil(stat.size / CHUNK_SIZE);
+    LAST_CHUNK_COUNT = totalChunks;
+
+    const fd = fs.openSync(filePath);
+
+    for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, stat.size);
+        const size = end - start;
+
+        const buffer = Buffer.alloc(size);
+        fs.readSync(fd, buffer, 0, size, start);
+
+        const formData = new FormData();
+        formData.append('uploadId', UPLOAD_ID);
+        formData.append('index', i);
+        formData.append('relative', relativePath);
+        formData.append('chunk', buffer, { filename: 'chunk.bin' });
+
+        await axios.post(`${SERVER_URL}/upload-chunk`, formData, {
+            headers: formData.getHeaders()
+        });
+
+        console.log(`  - Chunk ${i + 1}/${totalChunks} sent`);
+    }
+
+    fs.closeSync(fd);
+}
+

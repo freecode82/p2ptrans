@@ -1,0 +1,339 @@
+#!/usr/bin/env node
+
+/**
+ * P2P 2.1 — 완전 양방향 전송 시스템
+ * - 컨트롤 서버는 양쪽에서 항상 실행
+ * - 어느 노드에서 명령 내리든 A→B, B→A 전송 가능
+ * - Race Condition 제거: 데이터 서버 Health Check + 다운로드 재시도 added
+ * - send-host / target-host 구조
+ */
+
+const express = require("express");
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// -------------------------------------------
+// Utils
+// -------------------------------------------
+function fileExists(p) {
+    try { fs.accessSync(p); return true; }
+    catch { return false; }
+}
+
+function ensureDir(dir) {
+    if (!fileExists(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function drawProgress(downloaded, total) {
+    if (!total) return;
+    const ratio = downloaded / total;
+    const percent = Math.floor(ratio * 100);
+    const width = 40;
+    const filled = Math.floor(ratio * width);
+    const bar = "█".repeat(filled) + "-".repeat(width - filled);
+    process.stdout.write(`\r[${bar}] ${percent}% (${downloaded}/${total})`);
+    if (downloaded === total) process.stdout.write("\n");
+}
+
+// -------------------------------------------
+// CONTROL SERVER (항상 켜져 있음)
+// -------------------------------------------
+async function startControlServer(port, host) {
+    const app = express();
+    app.use(express.json());
+
+    console.log(`\n������ CONTROL SERVER RUNNING`);
+    console.log(`  Host: ${host}`);
+    console.log(`  Port: ${port}`);
+    console.log(`  Endpoint: http://${host}:${port}/api/download-file\n`);
+
+    // health check
+    app.get("/api/health", (req, res) => {
+        res.json({ status: "ok" });
+    });
+
+    /**
+     * 다운로드 수행 API
+     */
+    app.post("/api/download-file", async (req, res) => {
+        const { url, fileName, saveDir, progress } = req.body;
+
+        if (!url || !fileName) {
+            return res.status(400).json({ error: "url, fileName 필수" });
+        }
+
+        const destDir = saveDir ? path.resolve(saveDir) : process.cwd();
+        ensureDir(destDir);
+        const destPath = path.join(destDir, fileName);
+
+        console.log(`[CONTROL] 다운로드 요청`);
+        console.log(`  url   : ${url}`);
+        console.log(`  save  : ${destPath}`);
+
+        // 자동 재시도 로직 added
+        const MAX_RETRY = 5;
+        let attempt = 0;
+
+        while (attempt < MAX_RETRY) {
+            try {
+                const resp = await axios.get(url, { responseType: "stream" });
+
+                const total = parseInt(resp.headers["content-length"] || "0");
+                let downloaded = 0;
+
+                const ws = fs.createWriteStream(destPath);
+                await new Promise((resolve, reject) => {
+                    resp.data.on("data", chunk => {
+                        downloaded += chunk.length;
+                        if (progress && total) drawProgress(downloaded, total);
+                    });
+                    resp.data.on("error", reject);
+                    ws.on("error", reject);
+                    ws.on("finish", resolve);
+
+                    resp.data.pipe(ws);
+                });
+
+                console.log(`\n[CONTROL] 다운로드 완료`);
+                return res.status(200).json({ status: "ok", saved: destPath });
+
+            } catch (err) {
+                console.log(`[CONTROL] 다운로드 실패: ${err.message}`);
+                attempt++;
+                if (attempt >= MAX_RETRY) {
+                    console.log(`[CONTROL] 재시도 모두 실패 → 전송 중단`);
+                    return res.status(500).json({ error: err.message });
+                }
+                console.log(`[CONTROL] 재시도 ${attempt}/${MAX_RETRY}`);
+                await sleep(500);
+            }
+        }
+    });
+
+    app.listen(port, host);
+}
+
+// -------------------------------------------
+// SEND MODE (명령자)
+// -------------------------------------------
+async function startSendMode(opt) {
+    const {
+        sourceHost,
+        sourceFile,
+        sendPort,
+        targetHost,
+        targetPort,
+        targetSave,
+        progress
+    } = opt;
+
+    const filePath = path.resolve(sourceFile);
+    if (!fileExists(filePath)) {
+        console.error("source-file not found:", filePath);
+        process.exit(1);
+    }
+
+    const fileName = path.basename(filePath);
+    const fileSize = fs.statSync(filePath).size;
+
+    console.log(`\n[SEND] 전송 준비`);
+    console.log(`  송신자(source) : ${sourceHost}`);
+    console.log(`  수신자(target) : ${targetHost}`);
+    console.log(`  파일: ${filePath} (${fileSize} bytes)\n`);
+
+    await createTempSendServer({
+        filePath,
+        fileName,
+        sendHost: sourceHost,
+        sendPort,
+        targetHost,
+        targetPort,
+        targetSave,
+        progress
+    });
+}
+
+// -------------------------------------------
+// TEMP DATA SERVER (송신자에 생성)
+// + HEALTH CHECK
+// -------------------------------------------
+async function createTempSendServer(cfg) {
+    const {
+        filePath,
+        fileName,
+        sendHost,
+        sendPort,
+        targetHost,
+        targetPort,
+        targetSave,
+        progress
+    } = cfg;
+
+    const app = express();
+
+    // HEALTH CHECK
+    app.get("/health", (req, res) => {
+        res.json({ status: "ok" });
+    });
+
+    // 실제 파일 다운로드 엔드포인트
+    app.get("/download", (req, res) => {
+        console.log(`[DATA] 요청 들어옴: /download`);
+
+        const size = fs.statSync(filePath).size;
+
+        res.setHeader("Content-Type", "application/octet-stream");
+        res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+        res.setHeader("Content-Length", size);
+
+        const rs = fs.createReadStream(filePath);
+        rs.on("error", err => res.destroy(err));
+        rs.pipe(res);
+    });
+
+    const server = app.listen(sendPort, sendHost, async () => {
+        const dataURL = `http://${sendHost}:${sendPort}`;
+        console.log(`[DATA] 데이터 서버 ON → ${dataURL}`);
+
+        // -----------------------------
+        // 1) HEALTH CHECK LOOP
+        // -----------------------------
+        console.log(`[SEND] 데이터 서버 준비 확인 중...`);
+        const healthURL = `${dataURL}/health`;
+
+        let ready = false;
+        for (let i = 0; i < 60; i++) {  // 최대 20회 (약 2초)
+            try {
+                const r = await axios.get(healthURL, { timeout: 100 });
+                if (r.data && r.data.status === "ok") {
+                    ready = true;
+                    break;
+                }
+            } catch {}
+            await sleep(100);
+        }
+
+        if (!ready) {
+            console.error(`[SEND] 데이터 서버 준비 실패`);
+            server.close();
+            return;
+        }
+
+        console.log(`[SEND] 데이터 서버 준비 완료`);
+
+        // -----------------------------
+        // 2) target-host 에 다운로드 명령 보내기
+        // -----------------------------
+        const controlURL = `http://${targetHost}:${targetPort}/api/download-file`;
+
+        try {
+            const resp = await axios.post(controlURL, {
+                url: `http://${sendHost}:${sendPort}/download`,
+                fileName,
+                saveDir: targetSave,
+                progress
+            }, { timeout: 0 });
+
+            console.log(`[SEND] 상대 응답:`, resp.data);
+
+        } catch (err) {
+            console.error(`[SEND] 다운로드 명령 실패: ${err.message}`);
+        }
+
+        console.log(`[DATA] 데이터 서버 종료`);
+        server.close();
+    });
+}
+
+// -------------------------------------------
+// CLI Parser
+// -------------------------------------------
+function parseArgs(argv) {
+    const out = {};
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+        if (arg.startsWith("--")) {
+            const key = arg.slice(2);
+            const next = argv[i + 1];
+            if (!next || next.startsWith("-")) out[key] = true;
+            else { out[key] = next; i++; }
+        } else if (arg.startsWith("-")) {
+            const key = arg.slice(1);
+            const next = argv[i + 1];
+            if (!next || next.startsWith("-")) out[key] = true;
+            else { out[key] = next; i++; }
+        }
+    }
+    return out;
+}
+
+// -------------------------------------------
+// ENTRY POINT
+// -------------------------------------------
+(async () => {
+    const args = parseArgs(process.argv.slice(2));
+
+    // Control server
+    if (args.control) {
+        const host = args.h || args.host || "0.0.0.0";
+        const port = parseInt(args.p || args.port || 7000);
+        await startControlServer(port, host);
+        return;
+    }
+
+    // Send mode
+    if (args.send) {
+        const sourceHost = args["source-host"] || args["send-host"] || "127.0.0.1";
+        const sendPort   = parseInt(args["send-port"] || 9000);
+        const sourceFile = args["source-file"] || args.f;
+
+        const targetHost = args["target-host"] || args["client-host"];
+        const targetPort = parseInt(args["target-port"] || args["client-port"] || 7000);
+        const targetSave = args["target-save"] || args["client-save"];
+        const progress   = args.b || args.progress;
+
+        if (!sourceFile) {
+            console.error("Error: --source-file <file> required");
+            process.exit(1);
+        }
+        if (!targetHost) {
+            console.error("Error: --target-host <IP> required");
+            process.exit(1);
+        }
+
+        await startSendMode({
+            sourceHost,
+            sourceFile,
+            sendPort,
+            targetHost,
+            targetPort,
+            targetSave,
+            progress
+        });
+        return;
+    }
+
+    // Usage
+    console.log(`
+사용법:
+
+## CONTROL SERVER (양쪽에서 항상 실행)
+node p2pnode.js --control -p 7000 -h 0.0.0.0
+
+## ANY NODE → SEND COMMAND (전송 방향 자유)
+node p2pnode.js --send \\
+    --source-host 192.168.79.9 \\
+    --source-file /root/a.bin \\
+    --send-port 9000 \\
+    --target-host 192.168.146.131 \\
+    --target-port 7000 \\
+    --target-save /root/downloads \\
+    -b
+    `);
+})();
+

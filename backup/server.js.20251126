@@ -1,0 +1,71 @@
+#!/usr/bin/env node
+
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+
+// 옵션 파싱
+const args = process.argv.slice(2);
+const pIndex = args.indexOf('-p');
+const hIndex = args.indexOf('-h');
+const fIndex = args.indexOf('-f');
+
+const port = pIndex !== -1 ? parseInt(args[pIndex + 1]) : 80;
+const host = hIndex !== -1 ? args[hIndex + 1] : 'localhost';
+const defaultDir = fIndex !== -1 ? args[fIndex + 1] : null;
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({extended: true}));
+
+// multer — temp 저장공간
+const upload = multer({ dest: "temp/" });
+
+// 폴더 생성 함수
+function ensureDir(dirPath) {
+    if (!fs.existsSync(dirPath)) {
+        fs.mkdirSync(dirPath, { recursive: true });
+    }
+}
+
+app.post('/upload', upload.any(), (req, res) => {
+    const location = req.body.location;
+    const files = req.files;
+    const paths = JSON.parse(req.body.paths);   // ← client가 보낸 상대경로 배열
+
+    if (!files || files.length === 0 || !paths) {
+        return res.status(400).send("Invalid upload");
+    }
+
+    let baseDir;
+
+    // 저장 위치 결정
+    if (location && location.trim() !== "") {
+        baseDir = path.resolve(location);
+    } else if (defaultDir) {
+        baseDir = path.resolve(defaultDir);
+    } else {
+        baseDir = path.resolve("downloads");
+    }
+
+    ensureDir(baseDir);
+
+    // 파일 저장
+    files.forEach((file, i) => {
+        const relativePath = paths[i];                 // 폴더 포함 경로
+        const destPath = path.join(baseDir, relativePath);
+
+        ensureDir(path.dirname(destPath));
+
+        fs.renameSync(file.path, destPath);
+    });
+
+    res.status(200).send("OK");
+});
+
+// 서버 실행
+app.listen(port, host, () => {
+    console.log(`������ Server running at http://${host}:${port}`);
+});
+

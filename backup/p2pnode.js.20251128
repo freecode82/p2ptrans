@@ -1,0 +1,322 @@
+#!/usr/bin/env node
+
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+
+// -------------------------
+// 공용 유틸
+// -------------------------
+function fileExists(p) {
+    try {
+        fs.accessSync(p, fs.constants.F_OK);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function ensureDir(dirPath) {
+    if (!fileExists(dirPath)) {
+        fs.mkdirSync(dirPath, { recursive: true });
+    }
+}
+
+// 간단한 progress bar (옵션으로 쓸 수 있게 만들어 둠)
+function drawProgressBar(downloaded, total) {
+    if (!total || total <= 0) return;
+    const ratio = downloaded / total;
+    const percent = Math.floor(ratio * 100);
+    const width = 40;
+    const filled = Math.floor(width * ratio);
+    const bar = '█'.repeat(filled) + '-'.repeat(width - filled);
+    process.stdout.write(`\r[${bar}] ${percent}% (${downloaded}/${total} bytes)`);
+    if (downloaded >= total) {
+        process.stdout.write('\n');
+    }
+}
+
+// -------------------------
+// 컨트롤 서버 모드
+// -------------------------
+async function startControlServer(port, host) {
+    const app = express();
+    app.use(express.json());
+
+    // 헬스 체크
+    app.get('/api/health', (req, res) => {
+        res.json({ status: 'ok' });
+    });
+
+    /**
+     * POST /api/download-file
+     * {
+     *   "url": "http://SENDER_IP:PORT/download",
+     *   "fileName": "abc.bin",
+     *   "saveDir": "/path/to/save",
+     *   "showProgress": true  // optional
+     * }
+     */
+    app.post('/api/download-file', async (req, res) => {
+        const { url, fileName, saveDir, showProgress } = req.body || {};
+        if (!url || !fileName) {
+            return res.status(400).json({ error: 'url, fileName 필드는 필수입니다.' });
+        }
+
+        const dir = saveDir ? path.resolve(saveDir) : process.cwd();
+        ensureDir(dir);
+        const destPath = path.join(dir, fileName);
+
+        console.log(`\n[CONTROL] 파일 다운로드 요청 받음`);
+        console.log(`  - URL      : ${url}`);
+        console.log(`  - 저장 위치: ${destPath}`);
+
+        try {
+            const resp = await axios.get(url, { responseType: 'stream' });
+
+            const total = parseInt(resp.headers['content-length'] || '0', 10);
+            if (total) console.log(`  - 크기: ${total} bytes`);
+
+            let downloaded = 0;
+            const ws = fs.createWriteStream(destPath);
+
+            await new Promise((resolve, reject) => {
+                resp.data.on('data', (chunk) => {
+                    downloaded += chunk.length;
+                    if (showProgress && total) {
+                        drawProgressBar(downloaded, total);
+                    }
+                });
+                resp.data.on('error', reject);
+                ws.on('error', reject);
+                ws.on('finish', resolve);
+
+                resp.data.pipe(ws);
+            });
+
+            console.log(`\n[CONTROL] 다운로드 완료: ${destPath}`);
+            return res.status(200).json({ status: 'ok', path: destPath });
+
+        } catch (err) {
+            console.error(`[CONTROL] 다운로드 실패: ${err.message}`);
+            return res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.listen(port, host, () => {
+        console.log(`������ 컨트롤 서버 실행 중`);
+        console.log(`  - Host: ${host}`);
+        console.log(`  - Port: ${port}`);
+        console.log(`  - API : http://${host}:${port}/api/download-file`);
+    });
+}
+
+// -------------------------
+// SEND 모드 (내가 보내는 쪽)
+// -------------------------
+async function startSendMode(options) {
+    const {
+        filePath,
+        localHost,
+        dataPort,
+        remoteHost,
+        remotePort,
+        remoteSaveDir,
+        showProgress
+    } = options;
+
+    const resolvedFile = path.resolve(filePath);
+    if (!fileExists(resolvedFile)) {
+        console.error(`Error: 보낼 파일이 존재하지 않습니다 → ${resolvedFile}`);
+        process.exit(1);
+    }
+
+    const stat = fs.statSync(resolvedFile);
+    if (!stat.isFile()) {
+        console.error(`현재 예제는 "파일"만 전송합니다. 폴더 전송은 tar/gzip 등 추가 설계가 필요합니다.`);
+        process.exit(1);
+    }
+
+    const fileName = path.basename(resolvedFile);
+
+    // 1) 임시 데이터 서버 띄우기
+    const app = express();
+
+    app.get('/download', (req, res) => {
+        console.log(`[DATA] /download 요청 들어옴, 파일 전송 시작: ${resolvedFile}`);
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        res.setHeader('Content-Length', stat.size);
+
+        const rs = fs.createReadStream(resolvedFile);
+        rs.on('error', (err) => {
+            console.error('[DATA] ReadStream Error:', err.message);
+            res.destroy(err);
+        });
+        rs.pipe(res);
+    });
+
+    const server = app.listen(dataPort, localHost, async () => {
+        const dataUrl = `http://${localHost}:${dataPort}/download`;
+        console.log(`\n[DATA] 임시 데이터 서버 실행 중`);
+        console.log(`  - URL      : ${dataUrl}`);
+        console.log(`  - FilePath : ${resolvedFile}`);
+        console.log(`  - Size     : ${stat.size} bytes`);
+
+        // 2) 상대 컨트롤 서버에 REST 요청 보내서 다운로드 시작시키기
+        const controlUrl = `http://${remoteHost}:${remotePort}/api/download-file`;
+        console.log(`\n[CONTROL-CLIENT] 상대 컨트롤 서버 호출`);
+        console.log(`  - URL: ${controlUrl}`);
+
+        try {
+            const resp = await axios.post(controlUrl, {
+                url: dataUrl,
+                fileName,
+                saveDir: remoteSaveDir,
+                showProgress: !!showProgress
+            }, {
+                timeout: 0   // 큰 파일도 끝까지 기다리도록
+            });
+
+            console.log(`\n[CONTROL-CLIENT] 상대 응답:`, resp.status, resp.data);
+
+        } catch (err) {
+            console.error(`\n[CONTROL-CLIENT] 호출 실패: ${err.message}`);
+        } finally {
+            // 3) 전송 끝났으니 데이터 서버 종료
+            console.log(`\n[DATA] 임시 데이터 서버 종료`);
+            server.close();
+        }
+    });
+}
+
+// -------------------------
+// CLI 파싱
+// -------------------------
+function parseArgs(argv) {
+    const out = { _: [] };
+    for (let i = 0; i < argv.length; i++) {
+        const a = argv[i];
+        if (a.startsWith('--')) {
+            const key = a.slice(2);
+            const next = argv[i + 1];
+            if (!next || next.startsWith('-')) {
+                out[key] = true;
+            } else {
+                out[key] = next;
+                i++;
+            }
+        } else if (a.startsWith('-')) {
+            const key = a.slice(1);
+            const next = argv[i + 1];
+            if (!next || next.startsWith('-')) {
+                out[key] = true;
+            } else {
+                out[key] = next;
+                i++;
+            }
+        } else {
+            out._.push(a);
+        }
+    }
+    return out;
+}
+
+// -------------------------
+// 엔트리 포인트
+// -------------------------
+(async () => {
+    const argv = parseArgs(process.argv.slice(2));
+
+    const isControl = argv.control || argv['control'] === '' || argv['--control'];
+    const isSend    = argv.send    || argv['send'] === ''    || argv['--send'];
+
+    if (isControl) {
+        const port = argv.p ? parseInt(argv.p, 10) : (argv.port ? parseInt(argv.port, 10) : 7000);
+        const host = argv.h || argv.host || '0.0.0.0';
+        await startControlServer(port, host);
+        return;
+    }
+
+    if (isSend) {
+        const filePath = argv.f || argv.file;
+        if (!filePath) {
+            console.error('Error: --send 모드에서는 -f <보낼 파일 경로> 가 필요합니다.');
+            process.exit(1);
+        }
+
+        const localHost = argv['local-host'] || argv.lh || '0.0.0.0';
+        const dataPort  = argv['data-port']  || argv.dp || 9000;
+
+        const remoteHost = argv['remote-host'] || argv.rh;
+        const remotePort = argv['remote-port'] || argv.rp || 7000;
+        const remoteSaveDir = argv['remote-save'] || argv.rs || null;
+
+        if (!remoteHost) {
+            console.error('Error: --send 모드에서는 --remote-host (또는 -rh) 가 필요합니다.');
+            process.exit(1);
+        }
+
+        const showProgress = !!(argv.b || argv['progress']);
+
+        await startSendMode({
+            filePath,
+            localHost,
+            dataPort: parseInt(dataPort, 10),
+            remoteHost,
+            remotePort: parseInt(remotePort, 10),
+            remoteSaveDir,
+            showProgress
+        });
+        return;
+    }
+
+    // 사용법 출력
+    console.log(`
+사용법:
+
+1) 컨트롤 서버 실행 (각 노드에서 1번씩 띄워두기)
+   node p2pnode.js --control -p 7000 -h 0.0.0.0
+
+2) A → B 로 파일 보내기 (A에서 실행)
+   node p2pnode.js --send \\
+       -f /path/to/file \\
+       --local-host A_IP \\
+       --data-port 9000 \\
+       --remote-host B_IP \\
+       --remote-port 7000 \\
+       --remote-save /remote/save/dir \\
+       -b
+
+옵션 요약:
+  --control, -control       컨트롤 서버 모드
+    -p, --port              컨트롤 서버 포트 (기본 7000)
+    -h, --host              바인딩할 IP (기본 0.0.0.0)
+
+  --send                    파일 보내기 모드
+    -f, --file              보낼 파일 경로
+    --local-host, -lh       임시 데이터 서버에서 사용할 내 IP (상대가 접근 가능한 IP)
+    --data-port,  -dp       임시 데이터 서버 포트 (기본 9000)
+    --remote-host, -rh      상대 컨트롤 서버 IP
+    --remote-port, -rp      상대 컨트롤 서버 포트 (기본 7000)
+    --remote-save, -rs      상대 쪽에서 저장할 디렉터리 (없으면 상대 current dir)
+    -b, --progress          상대 다운로드 진행률 표시
+
+예시:
+
+  # 각 노드에서 컨트롤 서버 실행
+  node p2pnode.js --control -p 7000 -h 0.0.0.0
+
+  # A(10.0.0.10) → B(10.0.0.20) 로 파일 보내기
+  node p2pnode.js --send \\
+      -f /root/test.jar \\
+      --local-host 10.0.0.10 \\
+      --data-port 9000 \\
+      --remote-host 10.0.0.20 \\
+      --remote-port 7000 \\
+      --remote-save /root/downloads \\
+      -b
+`);
+})();
+
