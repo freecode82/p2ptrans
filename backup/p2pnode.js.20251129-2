@@ -1,22 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * P2P 4.0 — 마스터/워커 + 파일/폴더 전송 + send-all 브로드캐스트
+ * P2P 3.0 — 파일 + 폴더 전송 시스템
  *
- * 모드:
- *  1) --control [--master] [--master-host ...]
- *     - 컨트롤 서버 실행 (다운로드, 전송 처리)
- *     - --master 가 있으면 마스터 모드 (노드 목록 관리 + /api/send-all 제공)
- *     - --master-host 가 있으면 워커 모드 (마스터에 자기 자신 등록)
- *
- *  2) --send
- *     - 기존 1:1 전송 (source-host → target-host)
- *
- *  3) --send-all
- *     - 마스터에 명령을 내려, source-host → 모든 다른 노드로 브로드캐스트 전송
+ * - 컨트롤 서버는 양쪽에서 항상 실행 (--control)
+ * - 어느 노드에서 명령을 내려도 A → B, B → A 전송 가능 (--send)
+ * - source-host: 실제 파일/폴더가 있는 노드
+ * - target-host: 실제로 파일을 받아 저장할 노드
  *
  * 폴더 전송 규칙:
- *   - -t   : tar 로 묶어서 전송
+ *   - -t   : tar로 묶어서 전송
  *   - -g   : 파일이면 .gz, 폴더면 .tar.gz
  *   - -tg  : tar.gz 로 전송
  *   - 없음 : 폴더 RAW 전송 (압축/묶음 없이 구조 그대로, 최상위 폴더 포함)
@@ -31,7 +24,6 @@ const fs = require("fs");
 const path = require("path");
 const tar = require("tar");
 const zlib = require("zlib");
-const os = require("os");
 
 // -------------------------------------------
 // Utils
@@ -64,20 +56,31 @@ async function autoExtractArchive(archivePath) {
     const base = path.basename(archivePath);
     const dir = path.dirname(archivePath);
 
+    // .tar.gz / .tgz
     if (base.endsWith(".tar.gz") || base.endsWith(".tgz")) {
         console.log(`[CONTROL:DOWNLOAD] tar.gz 해제: ${archivePath}`);
-        await tar.x({ file: archivePath, cwd: dir, gzip: true });
+        await tar.x({
+            file: archivePath,
+            cwd: dir,
+            gzip: true
+        });
         fs.unlinkSync(archivePath);
         return;
     }
 
+    // .tar
     if (base.endsWith(".tar")) {
         console.log(`[CONTROL:DOWNLOAD] tar 해제: ${archivePath}`);
-        await tar.x({ file: archivePath, cwd: dir, gzip: false });
+        await tar.x({
+            file: archivePath,
+            cwd: dir,
+            gzip: false
+        });
         fs.unlinkSync(archivePath);
         return;
     }
 
+    // .gz (단일 파일)
     if (base.endsWith(".gz")) {
         console.log(`[CONTROL:DOWNLOAD] gz 해제: ${archivePath}`);
         const dest = archivePath.replace(/\.gz$/, "");
@@ -94,17 +97,22 @@ async function autoExtractArchive(archivePath) {
         fs.unlinkSync(archivePath);
         return;
     }
+
+    // 기타 확장자는 건드리지 않음
 }
 
 async function downloadToFileWithRetry(url, destPath, showProgress, label) {
     const MAX_RETRY = 5;
+
     for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
         try {
             const resp = await axios.get(url, { responseType: "stream" });
+
             const total = parseInt(resp.headers["content-length"] || "0", 10);
             let downloaded = 0;
 
             const ws = fs.createWriteStream(destPath);
+
             await new Promise((resolve, reject) => {
                 resp.data.on("data", chunk => {
                     downloaded += chunk.length;
@@ -113,10 +121,11 @@ async function downloadToFileWithRetry(url, destPath, showProgress, label) {
                 resp.data.on("error", reject);
                 ws.on("error", reject);
                 ws.on("finish", resolve);
+
                 resp.data.pipe(ws);
             });
 
-            return;
+            return; // 성공
         } catch (err) {
             console.warn(`[DOWNLOAD] 실패(${attempt}): ${label || destPath} → ${err.message}`);
             if (attempt >= MAX_RETRY) throw err;
@@ -166,21 +175,50 @@ async function prepareArchive(inputPath, packMode) {
         if (packMode === "tar") {
             outPath = path.join(tmpDir, `${base}.tar`);
             console.log(`[ARCHIVE] 폴더 tar 생성: ${outPath}`);
-            await tar.c({ file: outPath, cwd: path.dirname(inputPath), gzip: false }, [base]);
+            await tar.c(
+                {
+                    file: outPath,
+                    cwd: path.dirname(inputPath),
+                    gzip: false
+                },
+                [base]
+            );
         } else {
+            // gz 또는 targz → tar.gz
             outPath = path.join(tmpDir, `${base}.tar.gz`);
             console.log(`[ARCHIVE] 폴더 tar.gz 생성: ${outPath}`);
-            await tar.c({ file: outPath, cwd: path.dirname(inputPath), gzip: true }, [base]);
+            await tar.c(
+                {
+                    file: outPath,
+                    cwd: path.dirname(inputPath),
+                    gzip: true
+                },
+                [base]
+            );
         }
     } else {
         if (packMode === "tar") {
             outPath = path.join(tmpDir, `${base}.tar`);
             console.log(`[ARCHIVE] 파일 tar 생성: ${outPath}`);
-            await tar.c({ file: outPath, cwd: path.dirname(inputPath), gzip: false }, [base]);
+            await tar.c(
+                {
+                    file: outPath,
+                    cwd: path.dirname(inputPath),
+                    gzip: false
+                },
+                [base]
+            );
         } else if (packMode === "targz") {
             outPath = path.join(tmpDir, `${base}.tar.gz`);
             console.log(`[ARCHIVE] 파일 tar.gz 생성: ${outPath}`);
-            await tar.c({ file: outPath, cwd: path.dirname(inputPath), gzip: true }, [base]);
+            await tar.c(
+                {
+                    file: outPath,
+                    cwd: path.dirname(inputPath),
+                    gzip: true
+                },
+                [base]
+            );
         } else if (packMode === "gz") {
             outPath = path.join(tmpDir, `${base}.gz`);
             console.log(`[ARCHIVE] 파일 gz 생성: ${outPath}`);
@@ -211,29 +249,15 @@ async function prepareArchive(inputPath, packMode) {
 }
 
 // -------------------------------------------
-// CONTROL SERVER (양쪽에서 실행)
+// CONTROL SERVER (양쪽에서 항상 실행)
 // -------------------------------------------
-async function startControlServer(cfg) {
-    const { port, host, isMaster, masterHost, masterPort, publicHost, nodeName } = cfg;
-
+async function startControlServer(port, host) {
     const app = express();
     app.use(express.json());
 
-    // 마스터에서만 노드 목록 관리
-    const nodes = isMaster ? [] : null;
-
     console.log(`\n������ CONTROL SERVER RUNNING`);
-    console.log(`  Host(bind): ${host}`);
-    console.log(`  Port      : ${port}`);
-    if (isMaster) {
-        console.log(`  Mode      : MASTER`);
-        console.log(`  /api/register-node, /api/nodes, /api/send-all 활성`);
-    } else if (masterHost) {
-        console.log(`  Mode      : WORKER (master: ${masterHost}:${masterPort})`);
-    } else {
-        console.log(`  Mode      : STANDALONE`);
-    }
-
+    console.log(`  Host: ${host}`);
+    console.log(`  Port: ${port}`);
     console.log(`  /api/download-file`);
     console.log(`  /api/download-folder-raw`);
     console.log(`  /api/send-file\n`);
@@ -242,159 +266,6 @@ async function startControlServer(cfg) {
     app.get("/api/health", (req, res) => {
         res.json({ status: "ok" });
     });
-
-    // ---------- 마스터 전용 API ----------
-    if (isMaster) {
-        // 자기 자신도 노드로 등록
-        const selfHost = publicHost || host;
-        nodes.push({
-            host: selfHost,
-            ctrlPort: port,
-            name: nodeName || os.hostname() || "master",
-            lastSeen: Date.now()
-        });
-
-        app.post("/api/register-node", (req, res) => {
-            const { host, ctrlPort, name } = req.body || {};
-            if (!host || !ctrlPort) {
-                return res.status(400).json({ error: "host, ctrlPort 필수" });
-            }
-            const now = Date.now();
-            const idx = nodes.findIndex(
-                n => n.host === host && n.ctrlPort === ctrlPort
-            );
-            if (idx === -1) {
-                nodes.push({ host, ctrlPort, name: name || "", lastSeen: now });
-                console.log(`[MASTER] 노드 등록: ${host}:${ctrlPort} (${name || ""})`);
-            } else {
-                nodes[idx].lastSeen = now;
-                nodes[idx].name = name || nodes[idx].name;
-                console.log(`[MASTER] 노드 갱신: ${host}:${ctrlPort} (${nodes[idx].name})`);
-            }
-            res.json({ status: "ok" });
-        });
-
-        app.get("/api/nodes", (req, res) => {
-            res.json({ nodes });
-        });
-
-        /**
-         * /api/send-all
-         * body:
-         *  {
-         *    sourceHost,
-         *    sourceFile,
-         *    sourceCtrlPort,
-         *    sendPort,
-         *    targetSave,
-         *    packMode,
-         *    autoExtract,
-         *    progress
-         *  }
-         */
-        app.post("/api/send-all", async (req, res) => {
-            const {
-                sourceHost,
-                sourceFile,
-                sourceCtrlPort,
-                sendPort,
-                targetSave,
-                packMode,
-                autoExtract,
-                progress
-            } = req.body || {};
-
-            if (!sourceHost || !sourceFile) {
-                return res.status(400).json({ error: "sourceHost, sourceFile 필수" });
-            }
-
-            const sCtrlPort = parseInt(sourceCtrlPort || port, 10);
-            const dPort = parseInt(sendPort || 9000, 10);
-
-            console.log(`\n[MASTER] send-all 요청`);
-            console.log(`  source : ${sourceHost}:${sCtrlPort}`);
-            console.log(`  file   : ${sourceFile}`);
-            console.log(`  sendPort(data): ${dPort}`);
-            console.log(`  packMode      : ${packMode}`);
-            console.log(`  autoExtract   : ${autoExtract ? "ON" : "OFF"}`);
-            console.log(`  targetSave    : ${targetSave || "(target current dir)"}`);
-
-            if (!nodes || nodes.length === 0) {
-                return res.status(400).json({ error: "등록된 노드 없음" });
-            }
-
-            // 타겟: sourceHost:sourceCtrlPort 를 제외한 나머지
-            const targets = nodes.filter(
-                n => !(n.host === sourceHost && n.ctrlPort === sCtrlPort)
-            );
-
-            console.log(`  대상 노드 수: ${targets.length}`);
-            if (targets.length === 0) {
-                return res.status(400).json({ error: "source 외 대상 노드 없음" });
-            }
-
-            const results = [];
-
-            for (const node of targets) {
-                console.log(
-                    `[MASTER] 대상 → ${node.host}:${node.ctrlPort} 로 전송 시작`
-                );
-                try {
-                    const sendUrl = `http://${sourceHost}:${sCtrlPort}/api/send-file`;
-                    const body = {
-                        filePath: sourceFile,
-                        dataPort: dPort,
-                        sourceHost,
-                        targetHost: node.host,
-                        targetCtrlPort: node.ctrlPort,
-                        targetSave,
-                        progress,
-                        packMode,
-                        autoExtract
-                    };
-                    const resp = await axios.post(sendUrl, body, { timeout: 0 });
-                    console.log(
-                        `[MASTER]   성공: ${node.host}:${node.ctrlPort} →`,
-                        resp.data
-                    );
-                    results.push({
-                        host: node.host,
-                        ctrlPort: node.ctrlPort,
-                        ok: true,
-                        detail: resp.data
-                    });
-                } catch (err) {
-                    console.error(
-                        `[MASTER]   실패: ${node.host}:${node.ctrlPort} → ${err.message}`
-                    );
-                    results.push({
-                        host: node.host,
-                        ctrlPort: node.ctrlPort,
-                        ok: false,
-                        error: err.message
-                    });
-                }
-            }
-
-            console.log(`[MASTER] send-all 완료`);
-            return res.json({
-                status: "ok",
-                sourceHost,
-                targets: results
-            });
-        });
-    } else {
-        // 워커/스탠드얼론에서 master 전용 API 호출 시 에러 응답
-        app.post("/api/register-node", (req, res) => {
-            res.status(400).json({ error: "not a master node" });
-        });
-        app.get("/api/nodes", (req, res) => {
-            res.status(400).json({ error: "not a master node" });
-        });
-        app.post("/api/send-all", (req, res) => {
-            res.status(400).json({ error: "not a master node" });
-        });
-    }
 
     /**
      * 단일 파일/아카이브 다운로드
@@ -418,9 +289,11 @@ async function startControlServer(cfg) {
 
         try {
             await downloadToFileWithRetry(url, destPath, !!progress, fileName);
+
             if (autoExtract) {
                 await autoExtractArchive(destPath);
             }
+
             console.log(`[CONTROL:DOWNLOAD] 완료`);
             return res.status(200).json({ status: "ok", saved: destPath });
         } catch (err) {
@@ -431,14 +304,14 @@ async function startControlServer(cfg) {
 
     /**
      * RAW 폴더 다운로드
-     * body: { baseUrl, saveDir }
+     * body: { baseUrl, saveDir, progress }
      *
      * baseUrl: "http://sourceHost:dataPort"
      *  - GET {baseUrl}/list   → { rootName, files }
      *  - GET {baseUrl}/download?file=...  파일별
      */
     app.post("/api/download-folder-raw", async (req, res) => {
-        const { baseUrl, saveDir } = req.body || {};
+        const { baseUrl, saveDir, progress } = req.body || {};
         if (!baseUrl) {
             return res.status(400).json({ error: "baseUrl 필수" });
         }
@@ -472,11 +345,7 @@ async function startControlServer(cfg) {
             }
 
             console.log(`[CONTROL:FOLDER] RAW 폴더 다운로드 완료`);
-            return res.status(200).json({
-                status: "ok",
-                savedRoot: destRoot,
-                count: files.length
-            });
+            return res.status(200).json({ status: "ok", savedRoot: destRoot, count: files.length });
         } catch (err) {
             console.error(`[CONTROL:FOLDER] 실패: ${err.message}`);
             return res.status(500).json({ error: err.message });
@@ -494,8 +363,8 @@ async function startControlServer(cfg) {
      *    targetCtrlPort,
      *    targetSave,
      *    progress,
-     *    packMode,    // none | tar | gz | targz
-     *    autoExtract  // true/false
+     *    packMode,      // none | tar | gz | targz
+     *    autoExtract    // true/false (target에서)
      *  }
      */
     app.post("/api/send-file", async (req, res) => {
@@ -540,13 +409,14 @@ async function startControlServer(cfg) {
         console.log(`  save   : ${targetSave || "(target current dir)"}`);
         console.log(`  autoExtract: ${autoExtract ? "ON" : "OFF"}`);
 
-        // ---- RAW 폴더 모드 ----
+        // ---- 1) RAW 폴더 모드 ----
         if (isDir && mode === "none") {
             const baseDir = resolvedPath;
             const rootName = path.basename(baseDir);
 
             const dataApp = express();
 
+            // /list → { rootName, files[] }
             dataApp.get("/list", (req2, res2) => {
                 try {
                     const files = walkDir(baseDir);
@@ -556,6 +426,7 @@ async function startControlServer(cfg) {
                 }
             });
 
+            // /download?file=상대경로
             dataApp.get("/download", (req2, res2) => {
                 const rel = req2.query.file;
                 if (!rel) {
@@ -574,10 +445,8 @@ async function startControlServer(cfg) {
 
                 res2.setHeader("Content-Type", "application/octet-stream");
                 res2.setHeader("Content-Length", size);
-                res2.setHeader(
-                    "Content-Disposition",
-                    `attachment; filename="${path.basename(resolved)}"`
-                );
+                res2.setHeader("Content-Disposition",
+                    `attachment; filename="${path.basename(resolved)}"`);
 
                 const rs = fs.createReadStream(resolved);
                 rs.on("error", err => {
@@ -588,19 +457,17 @@ async function startControlServer(cfg) {
             });
 
             const dataServer = dataApp.listen(portData, "0.0.0.0", async () => {
-                console.log(
-                    `[DATA:RAW] 폴더 RAW 서버 ON → http://${sourceHost}:${portData}`
-                );
+                console.log(`[DATA:RAW] 폴더 RAW 서버 ON → http://${sourceHost}:${portData}`);
 
                 const baseUrl = `http://${sourceHost}:${portData}`;
                 const targetCtrlUrl = `http://${targetHost}:${targetPort}/api/download-folder-raw`;
 
                 try {
-                    const resp = await axios.post(
-                        targetCtrlUrl,
-                        { baseUrl, saveDir: targetSave },
-                        { timeout: 0 }
-                    );
+                    const resp = await axios.post(targetCtrlUrl, {
+                        baseUrl,
+                        saveDir: targetSave,
+                        progress
+                    }, { timeout: 0 });
 
                     console.log(`[CONTROL:SEND] 대상 응답:`, resp.data);
                     res.status(200).json({ status: "ok", detail: resp.data });
@@ -616,7 +483,7 @@ async function startControlServer(cfg) {
             return;
         }
 
-        // ---- 단일 파일 / 아카이브 모드 ----
+        // ---- 2) 단일 파일 / 아카이브 모드 ----
         let archivePath = resolvedPath;
         let archiveName = path.basename(resolvedPath);
         let cleanup = false;
@@ -628,7 +495,8 @@ async function startControlServer(cfg) {
             cleanup = prep.cleanup;
         }
 
-        const size2 = fs.statSync(archivePath).size;
+        const size = fs.statSync(archivePath).size;
+
         const dataApp = express();
 
         dataApp.get("/download", (req2, res2) => {
@@ -636,7 +504,7 @@ async function startControlServer(cfg) {
 
             res2.setHeader("Content-Type", "application/octet-stream");
             res2.setHeader("Content-Disposition", `attachment; filename="${archiveName}"`);
-            res2.setHeader("Content-Length", size2);
+            res2.setHeader("Content-Length", size);
 
             const rs = fs.createReadStream(archivePath);
             rs.on("error", err => {
@@ -647,25 +515,19 @@ async function startControlServer(cfg) {
         });
 
         const dataServer = dataApp.listen(portData, "0.0.0.0", async () => {
-            console.log(
-                `[DATA] 단일 파일/아카이브 서버 ON → http://${sourceHost}:${portData}/download`
-            );
+            console.log(`[DATA] 단일 파일/아카이브 서버 ON → http://${sourceHost}:${portData}/download`);
 
             const downloadUrl = `http://${sourceHost}:${portData}/download`;
             const targetCtrlUrl = `http://${targetHost}:${targetPort}/api/download-file`;
 
             try {
-                const resp = await axios.post(
-                    targetCtrlUrl,
-                    {
-                        url: downloadUrl,
-                        fileName: archiveName,
-                        saveDir: targetSave,
-                        progress,
-                        autoExtract: !!autoExtract
-                    },
-                    { timeout: 0 }
-                );
+                const resp = await axios.post(targetCtrlUrl, {
+                    url: downloadUrl,
+                    fileName: archiveName,
+                    saveDir: targetSave,
+                    progress,
+                    autoExtract: !!autoExtract
+                }, { timeout: 0 });
 
                 console.log(`[CONTROL:SEND] 대상 응답:`, resp.data);
                 res.status(200).json({ status: "ok", detail: resp.data });
@@ -682,37 +544,11 @@ async function startControlServer(cfg) {
         });
     });
 
-    const server = app.listen(port, host, async () => {
-        console.log(`\n[CONTROL] 서버 리스닝: ${host}:${port}`);
-
-        // 워커 모드라면 마스터에 등록
-        if (!isMaster && masterHost) {
-            try {
-                const regUrl = `http://${masterHost}:${masterPort}/api/register-node`;
-                const pubHost = publicHost || host;
-                const name = nodeName || os.hostname() || "";
-                console.log(
-                    `[WORKER] 마스터 등록 시도 → ${regUrl} as ${pubHost}:${port}`
-                );
-                await axios.post(regUrl, {
-                    host: pubHost,
-                    ctrlPort: port,
-                    name
-                });
-                console.log(`[WORKER] 마스터 등록 성공`);
-            } catch (err) {
-                console.error(
-                    `[WORKER] 마스터 등록 실패: ${err.message} (마스터가 나중에 뜨면 수동 호출 필요)`
-                );
-            }
-        }
-    });
-
-    return server;
+    app.listen(port, host);
 }
 
 // -------------------------------------------
-// SEND MODE (1:1)
+// SEND MODE (오케스트레이터)
 // -------------------------------------------
 async function startSendMode(opt) {
     const {
@@ -730,7 +566,7 @@ async function startSendMode(opt) {
 
     const controlUrl = `http://${sourceHost}:${sourceCtrlPort}/api/send-file`;
 
-    console.log(`\n[SEND] 전송 명령 시작 (1:1)`);
+    console.log(`\n[SEND] 전송 명령 시작`);
     console.log(`  source-host(ctrl) : ${sourceHost}:${sourceCtrlPort}`);
     console.log(`  target-host(ctrl) : ${targetHost}:${targetCtrlPort}`);
     console.log(`  file/folder       : ${sourceFile}`);
@@ -740,75 +576,21 @@ async function startSendMode(opt) {
     console.log(`  targetSave        : ${targetSave || "(target current dir)"}`);
 
     try {
-        const resp = await axios.post(
-            controlUrl,
-            {
-                filePath: sourceFile,
-                dataPort: sendPort,
-                sourceHost,
-                targetHost,
-                targetCtrlPort,
-                targetSave,
-                progress,
-                packMode,
-                autoExtract
-            },
-            { timeout: 0 }
-        );
+        const resp = await axios.post(controlUrl, {
+            filePath: sourceFile,
+            dataPort: sendPort,
+            sourceHost,
+            targetHost,
+            targetCtrlPort,
+            targetSave,
+            progress,
+            packMode,
+            autoExtract
+        }, { timeout: 0 });
+
         console.log(`\n[SEND] 완료 응답:`, resp.data);
     } catch (err) {
         console.error(`\n[SEND] 실패: ${err.message}`);
-    }
-}
-
-// -------------------------------------------
-// SEND-ALL MODE (마스터를 통한 브로드캐스트)
-// -------------------------------------------
-async function startSendAllMode(opt) {
-    const {
-        masterHost,
-        masterPort,
-        sourceHost,
-        sourceFile,
-        sourceCtrlPort,
-        sendPort,
-        targetSave,
-        packMode,
-        autoExtract,
-        progress
-    } = opt;
-
-    const url = `http://${masterHost}:${masterPort}/api/send-all`;
-
-    console.log(`\n[SEND-ALL] 브로드캐스트 전송 명령`);
-    console.log(`  master      : ${masterHost}:${masterPort}`);
-    console.log(`  source-host : ${sourceHost}:${sourceCtrlPort}`);
-    console.log(`  file/folder : ${sourceFile}`);
-    console.log(`  sendPort    : ${sendPort}`);
-    console.log(`  packMode    : ${packMode}`);
-    console.log(`  autoExtract : ${autoExtract ? "ON" : "OFF"}`);
-    console.log(`  targetSave  : ${targetSave || "(target current dir)"}`);
-
-    try {
-        const resp = await axios.post(
-            url,
-            {
-                sourceHost,
-                sourceFile,
-                sourceCtrlPort,
-                sendPort,
-                targetSave,
-                packMode,
-                autoExtract,
-                progress
-            },
-            { timeout: 0 }
-        );
-
-        console.log(`\n[SEND-ALL] 완료 응답:`);
-        console.dir(resp.data, { depth: null });
-    } catch (err) {
-        console.error(`\n[SEND-ALL] 실패: ${err.message}`);
     }
 }
 
@@ -823,18 +605,12 @@ function parseArgs(argv) {
             const key = a.slice(2);
             const next = argv[i + 1];
             if (!next || next.startsWith("-")) out[key] = true;
-            else {
-                out[key] = next;
-                i++;
-            }
+            else { out[key] = next; i++; }
         } else if (a.startsWith("-")) {
             const key = a.slice(1);
             const next = argv[i + 1];
             if (!next || next.startsWith("-")) out[key] = true;
-            else {
-                out[key] = next;
-                i++;
-            }
+            else { out[key] = next; i++; }
         }
     }
     return out;
@@ -850,49 +626,29 @@ function parseArgs(argv) {
     if (args.control) {
         const host = args.h || args.host || "0.0.0.0";
         const port = parseInt(args.p || args.port || 7000, 10);
-
-        const isMaster = !!args.master;
-        const masterHost = args["master-host"] || null;
-        const masterPort = parseInt(args["master-port"] || 7000, 10);
-        const publicHost = args["node-host"] || args["public-host"] || null;
-        const nodeName = args["node-name"] || null;
-
-        await startControlServer({
-            port,
-            host,
-            isMaster,
-            masterHost: isMaster ? null : masterHost,
-            masterPort,
-            publicHost,
-            nodeName
-        });
+        await startControlServer(port, host);
         return;
     }
 
-    // SEND 모드 (1:1)
+    // SEND 모드
     if (args.send) {
-        const sourceHost = args["source-host"] || args["send-host"] || "127.0.0.1";
-        const sourceFile = args["source-file"] || args.f;
-        const sourceCtrlPort = parseInt(args["source-port"] || 7000, 10);
-        const sendPort = parseInt(args["send-port"] || 9000, 10);
+        const sourceHost      = args["source-host"] || args["send-host"] || "127.0.0.1";
+        const sourceFile      = args["source-file"] || args.f;
+        const sourceCtrlPort  = parseInt(args["source-port"] || 7000, 10);
+        const sendPort        = parseInt(args["send-port"] || 9000, 10);
 
-        const targetHost = args["target-host"] || args["client-host"];
-        const targetCtrlPort = parseInt(
-            args["target-port"] || args["client-port"] || 7000,
-            10
-        );
-        const targetSave = args["target-save"] || args["client-save"];
-        const progress = !!(args.b || args.progress);
+        const targetHost      = args["target-host"] || args["client-host"];
+        const targetCtrlPort  = parseInt(args["target-port"] || args["client-port"] || 7000, 10);
+        const targetSave      = args["target-save"] || args["client-save"];
+        const progress        = !!(args.b || args.progress);
 
-        const hasT = !!args.t;
-        const hasG = !!args.g;
-        const hasTG = !!args["tg"];
-        const noRelease = !!args["norelease"];
+        const hasT            = !!args.t;
+        const hasG            = !!args.g;
+        const hasTG           = !!args["tg"];
+        const noRelease       = !!args["norelease"];
 
         if (!sourceFile) {
-            console.error(
-                "Error: --source-file 또는 -f <파일 또는 폴더 경로> 가 필요합니다."
-            );
+            console.error("Error: --source-file 또는 -f <파일 또는 폴더 경로> 가 필요합니다.");
             process.exit(1);
         }
         if (!targetHost) {
@@ -900,11 +656,13 @@ function parseArgs(argv) {
             process.exit(1);
         }
 
+        // packMode 결정
         let packMode = "none";
         if (hasTG || (hasT && hasG)) packMode = "targz";
         else if (hasT) packMode = "tar";
         else if (hasG) packMode = "gz";
 
+        // autoExtract 결정 (-norelease 가 있으면 해제 안 함)
         const autoExtract = !noRelease && packMode !== "none";
 
         await startSendMode({
@@ -922,71 +680,19 @@ function parseArgs(argv) {
         return;
     }
 
-    // SEND-ALL 모드 (마스터 사용)
-    if (args["send-all"]) {
-        const masterHost = args["master-host"];
-        const masterPort = parseInt(args["master-port"] || 7000, 10);
-
-        const sourceHost = args["source-host"] || "127.0.0.1";
-        const sourceFile = args["source-file"] || args.f;
-        const sourceCtrlPort = parseInt(args["source-port"] || 7000, 10);
-        const sendPort = parseInt(args["send-port"] || 9000, 10);
-        const targetSave = args["target-save"] || args["client-save"];
-        const progress = !!(args.b || args.progress);
-
-        const hasT = !!args.t;
-        const hasG = !!args.g;
-        const hasTG = !!args["tg"];
-        const noRelease = !!args["norelease"];
-
-        if (!masterHost) {
-            console.error("Error: --master-host <IP> 가 필요합니다.");
-            process.exit(1);
-        }
-        if (!sourceFile) {
-            console.error(
-                "Error: --source-file 또는 -f <파일 또는 폴더 경로> 가 필요합니다."
-            );
-            process.exit(1);
-        }
-
-        let packMode = "none";
-        if (hasTG || (hasT && hasG)) packMode = "targz";
-        else if (hasT) packMode = "tar";
-        else if (hasG) packMode = "gz";
-
-        const autoExtract = !noRelease && packMode !== "none";
-
-        await startSendAllMode({
-            masterHost,
-            masterPort,
-            sourceHost,
-            sourceFile,
-            sourceCtrlPort,
-            sendPort,
-            targetSave,
-            packMode,
-            autoExtract,
-            progress
-        });
-        return;
-    }
-
     // 사용법
     console.log(`
 사용법:
 
-1) 마스터 컨트롤 서버 실행 (예: A)
-   node p2pnode.js --control --master -p 7000 -h 0.0.0.0
+1) 컨트롤 서버 (양쪽에서 실행)
+   node p2pnode.js --control -p 7000 -h 0.0.0.0
 
-2) 워커 컨트롤 서버 실행 (예: B, C, D)
-   node p2pnode.js --control \\
-     --master-host 192.168.79.9 \\
-     --master-port 7000 \\
-     --node-host 192.168.146.131 \\
-     -p 7000 -h 0.0.0.0
+2) 전송 명령 (파일 또는 폴더)
 
-3) 1:1 전송 (기존 방식)
+   # A(192.168.79.9) → B(192.168.146.131) 로 전송
+   # (명령은 A든 B든 아무 곳에서나 실행 가능)
+
+   ## 1) 파일/폴더를 tar.gz 로 보내고, 받는 쪽에서 자동 해제
    node p2pnode.js --send \\
      --source-host 192.168.79.9 \\
      --source-file /root/testdir \\
@@ -997,51 +703,48 @@ function parseArgs(argv) {
      --target-save /root/p2phttp/downloads \\
      -tg -b
 
-4) 브로드캐스트 전송 (send-all)
-   node p2pnode.js --send-all \\
-     --master-host 192.168.79.9 \\
-     --master-port 7000 \\
+   ## 2) 압축 없이 폴더 RAW 전송 (최상위 폴더 포함)
+   node p2pnode.js --send \\
      --source-host 192.168.79.9 \\
      --source-file /root/testdir \\
      --send-port 9000 \\
      --source-port 7000 \\
+     --target-host 192.168.146.131 \\
+     --target-port 7000 \\
+     --target-save /root/p2phttp/downloads
+
+   ## 3) 압축은 하지만 해제는 하지 않기 (-norelease)
+   node p2pnode.js --send \\
+     --source-host 192.168.79.9 \\
+     --source-file /root/testdir \\
+     --send-port 9000 \\
+     --source-port 7000 \\
+     --target-host 192.168.146.131 \\
+     --target-port 7000 \\
      --target-save /root/p2phttp/downloads \\
-     -tg -b
+     -tg -norelease -b
 
 옵션 정리:
 
   --control
     -p, --port          컨트롤 포트 (기본 7000)
     -h, --host          바인딩 IP (기본 0.0.0.0)
-    --master            마스터 모드 (노드 목록 관리 + send-all)
-    --master-host       워커 모드일 때 마스터의 IP
-    --master-port       마스터 컨트롤 포트 (기본 7000)
-    --node-host         다른 노드가 이 노드를 접근할 때 사용할 공개 IP/호스트
-    --node-name         노드 이름 표시용
 
-  --send (1:1)
+  --send
     --source-host       파일/폴더가 있는 노드 IP
     --source-file, -f   전송할 파일 또는 폴더 경로
     --source-port       source-host 컨트롤 포트 (기본 7000)
     --send-port         데이터 서버 포트 (기본 9000)
+
     --target-host       받을 노드 IP
     --target-port       target-host 컨트롤 포트 (기본 7000)
     --target-save       target-host가 저장할 디렉토리
+
     -t                  tar 로 묶어서 전송
     -g                  gzip 압축 (파일: .gz, 폴더: .tar.gz)
     -tg                 tar.gz 로 전송
     -norelease          받은 뒤 압축 해제하지 않음
     -b, --progress      단일 파일/아카이브 전송 시 진행률 표시
-
-  --send-all (마스터 사용)
-    --master-host       마스터 IP
-    --master-port       마스터 컨트롤 포트 (기본 7000)
-    --source-host       파일/폴더가 있는 노드 IP
-    --source-file, -f   전송할 파일 또는 폴더 경로
-    --source-port       source-host 컨트롤 포트 (기본 7000)
-    --send-port         데이터 서버 포트 (기본 9000)
-    --target-save       모든 대상 노드에서의 저장 디렉토리
-    -t, -g, -tg, -norelease, -b   (의미 동일)
 `);
 })();
 
